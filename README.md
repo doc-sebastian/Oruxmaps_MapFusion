@@ -8,7 +8,7 @@ Das Programm unterstützt **zwei Ausgabeformate**:
 | Format | Dateien | Ziel-Anwendung |
 | ------ | ------- | -------------- |
 | **OruxMaps** | `OruxMapsImages.db` + `<Name>.otrk2.xml` | OruxMaps (Android) |
-| **MBTiles** | `<Name>.mbtiles` | QMapShack (Windows/Linux/OSX), QGIS, etc. |
+| **MBTiles** | `<Name>.mbtiles` + `<Name>.vrt` | QMapShack (Windows/Linux/OSX), QGIS, etc. |
 
 ---
 
@@ -109,7 +109,7 @@ CREATE INDEX IND ON tiles (x, y, z);
 CREATE TABLE android_metadata (locale TEXT);   -- 'de_DE'
 ```
 
-> Wichtig: Die gespeicherten `(x, y, z)` sind **globale** OSM-256-Koordinaten, nicht die lokalen Koordinaten der Quell-Karten.
+> Wichtig: Die gespeicherten `(x, y, z)` sind **lokale** Koordinaten — pro Zoom-Level auf `(0,0)` normalisiert, damit OruxMaps die Tiles entsprechend der XML `xMax`/`yMax` findet.
 
 ### `<Name>.otrk2.xml`
 
@@ -145,11 +145,78 @@ CREATE TABLE android_metadata (locale TEXT);   -- 'de_DE'
 
 ---
 
-## Übernahme in OruxMaps (Android)
+## Ausgabe-Format: MBTiles (QMapShack)
+
+### `<Name>.mbtiles`
+
+SQLite-Datenbank nach MBTiles-Spezifikation (1.3). QMapShack, QGIS und weitere Werkzeuge unterstützen dieses Format direkt.
+
+```sql
+CREATE TABLE tiles (
+  zoom_level  integer,
+  tile_column integer,    -- OSM-x (global)
+  tile_row    integer,    -- TMS-y (invertiert: tms_y = 2^z − 1 − osm_y)
+  tile_data   blob,
+  PRIMARY KEY (zoom_level, tile_column, tile_row)
+);
+
+CREATE TABLE metadata (
+  name  text,
+  value text
+);
+```
+
+Metadaten-Schlüssel: `name`, `format` (png), `type` (baselayer), `version`, `bounds` (minLon,minLat,maxLon,maxLat), `minzoom`, `maxzoom`, `center`, `description`.
+
+> Die MBTiles-Koordinaten sind **global** (TMS mit y-Flip) — dies ist der Standard für MBTiles/QMapShack.
+
+### `<Name>.vrt`
+
+Eine GDAL/QMapShack Virtual-Raster-Datei, die automatisch neben der `.mbtiles` erzeugt wird. Sie erlaubt QMapShack und GDAL, die MBTiles als georeferenziertes Raster mit Zoom-Stufen (Overviews) zu laden.
+
+Aufbau:
+
+| Element | Bedeutung |
+| ------- | --------- |
+| `rasterXSize` / `rasterYSize` | Pixelabmessungen bei `maxZoom` (volle Auflösung) |
+| `SRS` | EPSG:3857 (WGS 84 / Pseudo-Mercator) |
+| `GeoTransform` | Top-Left-Ecke `(minLon→m, maxLat→m)`, Pixelgröße = Erdumfang / (256 · 2^maxZoom) |
+| `VRTRasterBand` ×4 | R/G/B/Alpha-Bänder, die auf die `.mbtiles` verweisen |
+| `OverviewList` | `2, 4, 8, …, 2^(maxZoom−minZoom)` — Zoom-Stufen für QMapShack |
+
+Beispiel:
+
+```xml
+<VRTDataset rasterXSize="2097152" rasterYSize="2097152">
+  <SRS dataAxisToSRSAxisMapping="1,2">PROJCS["WGS 84 / Pseudo-Mercator", …, AUTHORITY["EPSG","3857"]]</SRS>
+  <GeoTransform>  0.0,  4.777e+00,  0.0,  1.002e+07,  0.0, -4.777e+00</GeoTransform>
+  <VRTRasterBand dataType="Byte" band="1">
+    <ColorInterp>Red</ColorInterp>
+    <ComplexSource>
+      <SourceFilename relativeToVRT="1">MeineKarte.mbtiles</SourceFilename>
+      …
+    </ComplexSource>
+  </VRTRasterBand>
+  …
+  <OverviewList resampling="nearest">2 4 8 16 32 64 128 256 512 1024 2048 4096 8192</OverviewList>
+</VRTDataset>
+```
+
+---
+
+## Übernahme in Anwendungen
+
+### OruxMaps (Android)
 
 1. Den gesamten Ausgabeordner (mit `OruxMapsImages.db` und `<Name>.otrk2.xml`) auf das Android-Gerät kopieren — z. B. nach `OruxMaps/mapfiles/<Name>/`.
 2. In OruxMaps: **Manager → Offline-Karten → Neue Karte hinzufügen → OruxMaps**, dann die `.otrk2.xml` auswählen.
 3. Die fusionierte Karte erscheint mit dem vergebenen Kartennamen und allen Zoom-Leveln.
+
+### QMapShack (Windows/Linux/OSX)
+
+1. Den Ausgabeordner (mit `<Name>.mbtiles` und `<Name>.vrt`) auf den PC kopieren.
+2. In QMapShack: **Karte → Kartenliste → GDAL/Kachel-Datei hinzufügen**, dann die `.vrt`-Datei auswählen.
+3. QMapShack lädt die MBTiles über die VRT-Referenz und bietet alle Zoom-Stufen als Overviews an.
 
 ---
 
@@ -187,6 +254,3 @@ Dabei ist $z$ das Zoom-Level und die Tile-Koordinaten sind im OSM/Google-Raster 
 | **"database is locked"**                 | Tritt nicht mehr auf — das Ausgabeverzeichnis wird automatisch vom Scan ausgeschlossen. |
 | **512-Tiles erscheinen verzerrt**        | Pillow muss installiert sein, sonst können 512px-Karten nicht verarbeitet werden. |
 | **Geografische Überlappung**             | Bei überlappenden Karten gewinnt die zuletzt verarbeitete Quelle. Karten in der gewünschten Priorität-Reihenfolge ins Eingabeverzeichnis geben oder nachträglich sortieren. |
-
-
-Autor: Sebastian Fischer
