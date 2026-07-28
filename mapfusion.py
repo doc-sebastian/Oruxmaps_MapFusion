@@ -32,7 +32,7 @@ TILE_SIZE = 256  # OruxMaps arbeitet intern mit 256x256 px Tiles
 
 # Ausgabeformate
 FORMAT_ORUX = "orux"      # OruxMaps (OruxMapsImages.db + .otrk2.xml)
-FORMAT_MBTILES = "mbtiles"  # QMapShack-kompatibel (.mbtiles)
+FORMAT_MBTILES = "mbtiles"  # QMapShack-kompatibel (.mbtiles + .vrt)
 
 # Nachrichtentypen für Logging
 LOG_INFO = "INFO"
@@ -135,6 +135,111 @@ def write_mbtiles_metadata(conn, map_name, zoom_bounds):
     meta.append(("center", "%.6f,%.6f,%d" % (center_lon, center_lat, min_z)))
     cur.executemany("INSERT INTO metadata (name, value) VALUES (?, ?)", meta)
     conn.commit()
+
+
+def write_qmapshack_vrt(vrt_path, mbtiles_filename, map_name, zoom_bounds):
+    """
+    Schreibt eine QMapShack-kompatible .vrt-Datei für eine MBTiles-Karte.
+
+    Die VRT beschreibt das Raster bei maximaler Auflösung (maxZoom) und
+    enthält <OverviewList> für die kleineren Zoom-Stufen, die QMapShack/GDAL
+    aus der MBTiles nutzen.
+
+    vrt_path:        Vollständiger Pfad der zu schreibenden .vrt-Datei.
+    mbtiles_filename: Dateiname (ohne Pfad) der .mbtiles im gleichen Verzeichnis.
+    map_name:        Kartenname.
+    zoom_bounds:     Liste von Dicts mit 'zoom','minLat','maxLat','minLon','maxLon'.
+    """
+    R = 6378137.0  # WGS84-Äquatorradius (Web Mercator)
+    WORLD_M = R * math.pi * 2  # Erdumfang in Metern
+
+    min_z = min(zl['zoom'] for zl in zoom_bounds)
+    max_z = max(zl['zoom'] for zl in zoom_bounds)
+
+    min_lat = min(zl['minLat'] for zl in zoom_bounds)
+    max_lat = max(zl['maxLat'] for zl in zoom_bounds)
+    min_lon = min(zl['minLon'] for zl in zoom_bounds)
+    max_lon = max(zl['maxLon'] for zl in zoom_bounds)
+
+    # Web-Mercator-Meterkoordinaten der Bounding-Box
+    def lon_to_mx(lon):
+        return R * lon * math.pi / 180.0
+
+    def lat_to_my(lat):
+        lat = max(min(lat, 85.05112878), -85.05112878)
+        return R * math.asinh(math.tan(math.radians(lat)))
+
+    x_min = lon_to_mx(min_lon)
+    x_max = lon_to_mx(max_lon)
+    y_min = lat_to_my(min_lat)  # südlich → kleinerer y-Wert
+    y_max = lat_to_my(max_lat)  # nördlich → größerer y-Wert
+
+    # Pixelgröße bei maxZoom (Meter pro Pixel)
+    m_per_px = WORLD_M / (TILE_SIZE * (2 ** max_z))
+
+    # Rasterabmessungen bei maxZoom (volle Pixelauflösung)
+    raster_x = int(round((x_max - x_min) / m_per_px))
+    raster_y = int(round((y_max - y_min) / m_per_px))
+
+    # GeoTransform: top-left = (x_min, y_max), Pixel = ±m_per_px (eine Zeile)
+    gt_x = x_min
+    gt_y = y_max
+    gt = "  %.16e,  %.16e,  %.16e,  %.16e,  %.16e,  %.16e" % (
+        gt_x, m_per_px, 0.0, gt_y, 0.0, -m_per_px)
+
+    # OverviewList: 2, 4, 8, ... 2^(maxZoom-minZoom)
+    n_overviews = max_z - min_z
+    overviews = " ".join(str(2 ** i) for i in range(1, n_overviews + 1))
+
+    # SRS: EPSG:3857 (WGS 84 / Pseudo-Mercator)
+    srs = ('PROJCS["WGS 84 / Pseudo-Mercator",'
+           'GEOGCS["WGS 84",'
+           'DATUM["WGS_1984",'
+           'SPHEROID["WGS 84",6378137,298.257223563,'
+           'AUTHORITY["EPSG","7030"]],'
+           'AUTHORITY["EPSG","6326"]],'
+           'PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]],'
+           'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
+           'AUTHORITY["EPSG","4326"]],'
+           'PROJECTION["Mercator_1SP"],'
+           'PARAMETER["central_meridian",0],'
+           'PARAMETER["scale_factor",1],'
+           'PARAMETER["false_easting",0],'
+           'PARAMETER["false_northing",0],'
+           'UNIT["metre",1,AUTHORITY["EPSG","9001"]],'
+           'AXIS["Easting",EAST],'
+           'AXIS["Northing",NORTH],'
+           'EXTENSION["PROJ4",'
+           '"+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 '
+           '+x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],'
+           'AUTHORITY["EPSG","3857"]]')
+
+    bands = ['Red', 'Green', 'Blue', 'Alpha']
+    xml = []
+    xml.append('<VRTDataset rasterXSize="%d" rasterYSize="%d">' % (raster_x, raster_y))
+    xml.append('  <SRS dataAxisToSRSAxisMapping="1,2">%s</SRS>' % srs)
+    xml.append('  <GeoTransform>%s</GeoTransform>' % gt)
+    for i, color in enumerate(bands, start=1):
+        xml.append('  <VRTRasterBand dataType="Byte" band="%d">' % i)
+        xml.append('    <ColorInterp>%s</ColorInterp>' % color)
+        xml.append('    <ComplexSource>')
+        xml.append('      <SourceFilename relativeToVRT="1">%s</SourceFilename>' % mbtiles_filename)
+        xml.append('      <SourceBand>%d</SourceBand>' % i)
+        xml.append('      <SourceProperties RasterXSize="%d" RasterYSize="%d" DataType="Byte" '
+                   'BlockXSize="%d" BlockYSize="%d" />'
+                   % (raster_x, raster_y, TILE_SIZE, TILE_SIZE))
+        xml.append('      <SrcRect xOff="0" yOff="0" xSize="%d" ySize="%d" />'
+                   % (raster_x, raster_y))
+        xml.append('      <DstRect xOff="0" yOff="0" xSize="%d" ySize="%d" />'
+                   % (raster_x, raster_y))
+        xml.append('      <UseMaskBand>true</UseMaskBand>')
+        xml.append('    </ComplexSource>')
+        xml.append('  </VRTRasterBand>')
+    xml.append('  <OverviewList resampling="nearest">%s</OverviewList>' % overviews)
+    xml.append('</VRTDataset>')
+
+    with open(vrt_path, 'w', encoding='utf-8') as fh:
+        fh.write('\n'.join(xml) + '\n')
 
 
 # --------------------------------------------------------------------------------------
@@ -412,22 +517,13 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
     1. Liest alle Tiles aus allen Quell-DBs und rechnet lokale Tile-Koordinaten
        in globale Web-Mercator-Koordinaten um.
     2. Schreibt sie in die Ziel-DB:
-       - FORMAT_ORUX:    OruxMapsImages.db (OruxMaps-Schema, y wächst nach unten)
-       - FORMAT_MBTILES: <map_name>.mbtiles (MBTiles/QMapShack, TMS-y-Flip)
+       - FORMAT_ORUX:    OruxMapsImages.db — Tiles werden auf LOKALE
+                         Koordinaten (0-basiert pro Zoom-Level) normalisiert,
+                         weil OruxMaps die Tiles ab (0,0) entsprechend der
+                         XML xMax/yMax erwartet.
+       - FORMAT_MBTILES: <map_name>.mbtiles (QMapShack, TMS-y-Flip, globale
+                         Koordinaten wie in der MBTiles-Spezifikation).
     3. Sammelt die Bounding-Box pro Zoom-Level für die XML-Erzeugung.
-
-    Prinzip:
-      Jede Quell-Karte verwendet lokale Tile-Koordinaten (x,y ab 0).
-      Die MapBounds in der XML liefern die geografische Position.
-      Daraus lässt sich berechnen, bei welchem GLOBALEN Tile (im OSM-256-Raster)
-      die lokale (0,0) liegt:
-        gx = global_x_offset + lx   (bzw. * 2 bei 512px-Quellen)
-        gy = global_y_offset + ly
-      So landen alle Karten im gleichen globalen 256er-Koordinatensystem und
-      decken sich nicht gegenseitig, außer sie überlappen geografisch.
-
-    Falls eine Quell-Karte 512px-Tiles enthält, wird jedes in 4×256-Tiles
-    aufgespalten (setzt Pillow voraus, Parameter split_512=True).
 
     Gibt eine Liste von Zoom-Level-Dicts zurück.
     """
@@ -437,9 +533,11 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
     if db_format == FORMAT_MBTILES:
         out_db_full = os.path.join(out_dir, '%s.mbtiles' % map_name)
         write_fn = _write_tile_mbtiles
+        use_global_coords = True
     else:
         out_db_full = os.path.join(out_dir, 'OruxMapsImages.db')
-        write_fn = _write_tile_orux
+        write_fn = None  # wird nach Phase 1 gesetzt (interne Liste)
+        use_global_coords = False
 
     # Alte Zieldateien entfernen
     if os.path.exists(out_db_full):
@@ -448,13 +546,6 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
         p = out_db_full + ext
         if os.path.exists(p):
             os.remove(p)
-
-    out_conn = sqlite3.connect(out_db_full)
-    if db_format == FORMAT_MBTILES:
-        ensure_mbtiles_schema(out_conn)
-    else:
-        ensure_tiles_schema(out_conn)
-    out_cur = out_conn.cursor()
 
     # --- Bounding-Boxen pro Zoom-Level sammeln (Tile-Size wird immer 256) ---
     zoom_bounds = {}
@@ -490,9 +581,23 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
 
     log_fn(LOG_INFO, "Gesamt: %d Quell-Tiles von %d Karten." % (total_tiles, len(sources)))
 
-    # --- Tiles verarbeiten ---
+    # --- PHASE 1: Alle Tiles (global) einsammeln ---
+    # Für OruxMaps: dict pro zoom → {(gx, gy): blob} (später normalisiert)
+    # Für MBTiles:  direkt schreiben (globale Koordinaten = korrekt)
+    collected = {}  # z → {(gx, gy): blob}  — nur für OruxMaps
+
     processed = 0
-    counter = (0, 0)  # (inserted, skipped_dup)
+    counter = (0, 0)  # (inserted, skipped_dup) — nur für MBTiles
+
+    if not use_global_coords:
+        out_conn = None  # wird erst in Phase 2 erstellt
+    else:
+        out_conn = sqlite3.connect(out_db_full)
+        if db_format == FORMAT_MBTILES:
+            ensure_mbtiles_schema(out_conn)
+        else:
+            ensure_tiles_schema(out_conn)
+        out_cur = out_conn.cursor()
 
     for src in sources:
         log_fn(LOG_INFO, "Verarbeite: %s" % src.name)
@@ -519,8 +624,6 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
 
             for lx, ly, image_blob in rows:
                 if tile_size_src == 512 and split_512:
-                    # 512-Tile in 4 Sub-Tiles (à 256) zerlegen.
-                    # Ein lokales 512-Tile deckt 2x2 OSM-256-Tiles ab.
                     subs = _split_tile_512_to_256(image_blob)
                     if subs:
                         base_gx = gx_offset + 2 * lx
@@ -528,31 +631,73 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
                         for sx, sy, sub_blob in subs:
                             gx = base_gx + sx
                             gy = base_gy + sy
-                            counter = write_fn(out_cur, counter, gx, gy, z, sub_blob)
+                            if use_global_coords:
+                                counter = _write_tile_mbtiles(
+                                    out_cur, counter, gx, gy, z, sub_blob)
+                            else:
+                                collected.setdefault(z, {})[(gx, gy)] = sub_blob
                     else:
-                        # PIL hat das Bild nicht als 512 erkannt: Roh übernehmen
                         gx = gx_offset + lx
                         gy = gy_offset + ly
-                        counter = write_fn(out_cur, counter, gx, gy, z, image_blob)
+                        if use_global_coords:
+                            counter = _write_tile_mbtiles(
+                                out_cur, counter, gx, gy, z, image_blob)
+                        else:
+                            collected.setdefault(z, {})[(gx, gy)] = image_blob
                 else:
-                    # 256er-Tile direkt übernehmen
                     gx = gx_offset + lx
                     gy = gy_offset + ly
-                    counter = write_fn(out_cur, counter, gx, gy, z, image_blob)
+                    if use_global_coords:
+                        counter = _write_tile_mbtiles(
+                            out_cur, counter, gx, gy, z, image_blob)
+                    else:
+                        collected.setdefault(z, {})[(gx, gy)] = image_blob
 
                 processed += 1
                 if progress_fn and total_tiles > 0:
                     progress_fn(processed / total_tiles * 100)
 
         src_conn.close()
-        out_conn.commit()
+        if out_conn:
+            out_conn.commit()
 
-    # Bei MBTiles: Metadaten schreiben
+    # --- PHASE 2 (nur OruxMaps): Tiles in DB schreiben, normalisiert auf (0,0) ---
+    if not use_global_coords:
+        out_conn = sqlite3.connect(out_db_full)
+        ensure_tiles_schema(out_conn)
+        out_cur = out_conn.cursor()
+
+        inserted_orux = 0
+        for z in sorted(collected.keys()):
+            tiles_z = collected[z]
+            if not tiles_z:
+                continue
+            # Per-zoom: kleinstes (gx, gy) finden → Offset für Normalisierung
+            min_gx = min(k[0] for k in tiles_z)
+            min_gy = min(k[1] for k in tiles_z)
+            for (gx, gy), blob in tiles_z.items():
+                lx = gx - min_gx
+                ly = gy - min_gy
+                try:
+                    out_cur.execute(
+                        "INSERT OR REPLACE INTO tiles "
+                        "(x, y, z, image) VALUES (?,?,?,?)",
+                        (lx, ly, z, blob))
+                    inserted_orux += 1
+                except sqlite3.IntegrityError:
+                    pass  # Sollte nie passieren nach Normalisierung
+            out_conn.commit()
+            log_fn(LOG_INFO, "  z=%2d: %d Tiles (lokale Koordinaten ab 0,0)" % (z, len(tiles_z)))
+
+        out_conn.close()
+        log_fn(LOG_OK, "OruxMaps-DB geschrieben: %d Tiles." % inserted_orux)
+        counter = (inserted_orux, 0)
+
+    # Bei MBTiles: Metadaten schreiben und schließen
     if db_format == FORMAT_MBTILES:
         zoom_list = [{'zoom': z, **zoom_bounds[z]} for z in sorted(zoom_bounds.keys())]
         write_mbtiles_metadata(out_conn, map_name, zoom_list)
-
-    out_conn.close()
+        out_conn.close()
 
     inserted, skipped_dup = counter
     log_fn(LOG_OK, "Fertig: %d Tiles eingefügt, %d Duplikate übersprungen."
@@ -628,7 +773,7 @@ class MapFusionGUI:
         ttk.Radiobutton(inner_fmt, text="OruxMaps  (.otrk2.xml + OruxMapsImages.db)",
                         variable=self.out_format, value=FORMAT_ORUX).pack(
                             side='left', padx=(0, 20))
-        ttk.Radiobutton(inner_fmt, text="QMapShack / MBTiles  (.mbtiles)",
+        ttk.Radiobutton(inner_fmt, text="QMapShack / MBTiles  (.vrt + .mbtiles)",
                         variable=self.out_format, value=FORMAT_MBTILES).pack(
                             side='left')
 
@@ -825,7 +970,7 @@ class MapFusionGUI:
                     self._log, self._set_progress,
                     db_format=self.out_format.get())
 
-                # Bei OruxMaps: XML schreiben; bei MBTiles: fertig.
+                # Bei OruxMaps: XML schreiben; bei MBTiles: VRT schreiben.
                 if self.out_format.get() == FORMAT_ORUX:
                     xml_path = os.path.join(out_dir, "%s.otrk2.xml" % name)
                     self._log(LOG_INFO, "Schreibe %s …" % xml_path)
@@ -833,6 +978,12 @@ class MapFusionGUI:
                     self._log(LOG_OK, "XML geschrieben: %s" % xml_path)
                 else:
                     self._log(LOG_INFO, "MBTiles-Metadaten geschrieben.")
+                    # QMapShack-VRT-Datei erzeugen
+                    vrt_path = os.path.join(out_dir, "%s.vrt" % name)
+                    mbtiles_name = "%s.mbtiles" % name
+                    self._log(LOG_INFO, "Schreibe %s …" % vrt_path)
+                    write_qmapshack_vrt(vrt_path, mbtiles_name, name, zoom_levels)
+                    self._log(LOG_OK, "VRT geschrieben: %s" % vrt_path)
 
                 self._log(LOG_OK, "Fusion abgeschlossen!")
                 self._set_progress(100)
