@@ -301,6 +301,32 @@ def parse_otrk2_xml(xml_path):
 
 
 # --------------------------------------------------------------------------------------
+#  Helper: OSM-Tile-Rundung mit Floating-Point-Toleranz
+# --------------------------------------------------------------------------------------
+def _osm_round(val):
+    """
+    Rundet eine OSM-Tile-Koordinate (float) auf den nächsten Integer,
+    mit Toleranz fuer Floating-Point-Kantenwerte.
+
+    Die MapBounds der Quellkarten liegen exakt auf dem OSM-Tile-Raster
+    (z.B. Davos maxLat => tile_y = 11.0 bei zoom 5). Durch Gleitkomma-
+    Umkehrung via lat_to_tile_y() kann jedoch 10.9999999998 statt 11.0
+    herauskommen. floor() wuerde dann 10 liefern und die gesamte Karte um
+    ein Tile verschieben — die Georeferenzierung springt beim Zoomen.
+
+    Diese Funktion erkennt Werte knapp unter/ueber einer Ganzzahl und rundet
+    korrekt auf.
+    """
+    f = math.floor(val)
+    frac = val - f
+    if frac < 0.001:
+        return f
+    if frac > 0.999:
+        return f + 1
+    return int(round(val))
+
+
+# --------------------------------------------------------------------------------------
 #  XML-Generator: kombinierte .otrk2.xml schreiben
 # --------------------------------------------------------------------------------------
 def write_merged_otrk2_xml(xml_path, map_name, zoom_levels):
@@ -326,14 +352,16 @@ def write_merged_otrk2_xml(xml_path, map_name, zoom_levels):
         min_lon = zl['minLon']
         max_lon = zl['maxLon']
 
-        # Berechne globale Tile-Positionen
-        x_min_f = lon_to_tile_x(min_lon, z)
-        x_max_f = lon_to_tile_x(max_lon, z)
-        y_min_f = lat_to_tile_y(max_lat, z)  # oben → kleines y
-        y_max_f = lat_to_tile_y(min_lat, z)  # unten → großes y
+        # Berechne globale Tile-Positionen.
+        # _osm_round würfelt keine Tile-Offsets, sondern rundet Kanten, die
+        # durch float-Ungenauigkeit verschoben sind (z.B. 10.9999998 → 11).
+        x_min_r = _osm_round(lon_to_tile_x(min_lon, z))
+        x_max_r = _osm_round(lon_to_tile_x(max_lon, z))
+        y_min_r = _osm_round(lat_to_tile_y(max_lat, z))  # oben → kleines y
+        y_max_r = _osm_round(lat_to_tile_y(min_lat, z))  # unten → großes y
 
-        x_tiles = max(1, int(math.ceil(x_max_f)) - int(math.floor(x_min_f)))
-        y_tiles = max(1, int(math.ceil(y_max_f)) - int(math.floor(y_min_f)))
+        x_tiles = max(1, x_max_r - x_min_r)
+        y_tiles = max(1, y_max_r - y_min_r)
 
         width_px = x_tiles * TILE_SIZE
         height_px = y_tiles * TILE_SIZE
@@ -612,12 +640,13 @@ def merge_tiles_to_db(sources, out_dir, map_name, log_fn, progress_fn=None,
             tile_size_src = lv.get('tile_size', 256)
 
             # Globale Start-Tile-Koordinaten (im 256er OSM-Raster) für die
-            # obere linke Ecke dieser Karte:
-            gx_min_f = lon_to_tile_x(min_lon, z)
-            gy_min_f = lat_to_tile_y(max_lat, z)  # obere Kante
-
-            gx_offset = int(math.floor(gx_min_f))
-            gy_offset = int(math.floor(gy_min_f))
+            # obere linke Ecke dieser Karte.
+            # WICHTIG: Die MapBounds der Quellkarten liegen exakt auf dem
+            # OSM-Tile-Raster. Aufgrund von Gleitkomma-Ungenauigkeit (z.B.
+            # lat_to_tile_y ergibt 10.9999999998 statt 11.0) würde floor()
+            # das falsche Tile (10 statt 11) liefern. Daher _osm_round():
+            gx_offset = _osm_round(lon_to_tile_x(min_lon, z))
+            gy_offset = _osm_round(lat_to_tile_y(max_lat, z))  # obere Kante
 
             src_cur.execute("SELECT x, y, image FROM tiles WHERE z=?", (z,))
             rows = src_cur.fetchall()
